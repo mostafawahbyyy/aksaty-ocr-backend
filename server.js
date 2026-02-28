@@ -14,8 +14,6 @@ require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
 const rateLimit = require('express-rate-limit');
 
 const { preprocessImage } = require('./imagePreprocessor');
@@ -26,9 +24,9 @@ const app = express();
 const PORT = process.env.PORT || 5001;
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-// Multer config
+// Multer config — memory storage (required for Vercel serverless; no disk access)
 const upload = multer({
-  dest: 'uploads/',
+  storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
 });
 
@@ -130,8 +128,8 @@ const handleScan = async (req, res) => {
   console.log(`[${rid}] User: ${userId} | File: ${file.originalname || 'unknown'} (${(file.size / 1024).toFixed(0)}KB, ${file.mimetype})`);
 
   try {
-    // Read uploaded file
-    const rawBuffer = fs.readFileSync(file.path);
+    // Use in-memory buffer directly (no disk I/O on Vercel)
+    const rawBuffer = req.file.buffer;
 
     // Preprocess image
     console.log(`[${rid}] Preprocessing image...`);
@@ -143,9 +141,6 @@ const handleScan = async (req, res) => {
     const data = await extractPayments(processedBuffer, mimeType);
     const elapsed = Date.now() - startTime;
     console.log(`[${rid}] Gemini responded in ${elapsed}ms`);
-
-    // Clean up uploaded file
-    safeDelete(file.path);
 
     // No data extracted
     if (!data || !data.installments || data.installments.length === 0) {
@@ -172,7 +167,6 @@ const handleScan = async (req, res) => {
 
   } catch (err) {
     console.error(`[${rid}] Error:`, err.message);
-    safeDelete(file.path);
 
     // User-friendly error messages
     let userMessage = 'Could not read the document. Try taking a clearer photo with better lighting.';
@@ -197,34 +191,26 @@ const handleScan = async (req, res) => {
 app.post('/api/ocr/local', ocrLimiter, authMiddleware, upload.single('contract'), handleScan);
 app.post('/api/scan-contract', ocrLimiter, authMiddleware, upload.single('contract'), handleScan);
 
-// ─── Helpers ──────────────────────────────────────────────
-
-function safeDelete(filePath) {
-  try {
-    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  } catch (e) {
-    // ignore cleanup errors
-  }
-}
-
 // ─── Startup ──────────────────────────────────────────────
-
-// Ensure uploads directory exists
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
 // Initialize Gemini
 const geminiKey = process.env.GEMINI_API_KEY || process.env.GEN_AI_KEY;
 const geminiOk = initGemini(geminiKey);
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n=== AKSATY OCR Server ===`);
-  console.log(`Port:   ${PORT}`);
-  console.log(`Mode:   ${IS_PRODUCTION ? 'PRODUCTION' : 'DEVELOPMENT'}`);
-  console.log(`Auth:   ${IS_PRODUCTION ? 'REQUIRED' : 'OPTIONAL'}`);
-  console.log(`Gemini: ${geminiOk ? 'Enabled' : 'DISABLED (no API key)'}`);
-  console.log(`Limits: 100 req/15min (general), 10 req/min (OCR)`);
-  console.log(`Routes: POST /api/ocr/local, POST /api/scan-contract`);
-  console.log(`Health: GET /health`);
-  console.log(`========================\n`);
-});
+// Start server only when running locally (not on Vercel)
+if (process.env.VERCEL !== '1') {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`\n=== AKSATY OCR Server ===`);
+    console.log(`Port:   ${PORT}`);
+    console.log(`Mode:   ${IS_PRODUCTION ? 'PRODUCTION' : 'DEVELOPMENT'}`);
+    console.log(`Auth:   ${IS_PRODUCTION ? 'REQUIRED' : 'OPTIONAL'}`);
+    console.log(`Gemini: ${geminiOk ? 'Enabled' : 'DISABLED (no API key)'}`);
+    console.log(`Limits: 100 req/15min (general), 10 req/min (OCR)`);
+    console.log(`Routes: POST /api/ocr/local, POST /api/scan-contract`);
+    console.log(`Health: GET /health`);
+    console.log(`========================\n`);
+  });
+}
+
+// Export for Vercel serverless
+module.exports = app;
