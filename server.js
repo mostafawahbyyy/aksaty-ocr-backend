@@ -191,6 +191,133 @@ const handleScan = async (req, res) => {
 app.post('/api/ocr/local', ocrLimiter, authMiddleware, upload.single('contract'), handleScan);
 app.post('/api/scan-contract', ocrLimiter, authMiddleware, upload.single('contract'), handleScan);
 
+// ─── Market Estimate Endpoint ──────────────────────────────
+// Calls Gemini on the server side so the API key is never exposed in the app.
+
+const marketEstimateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: 'Too many estimate requests. Please wait a minute.' },
+});
+
+app.post('/api/market-estimate', marketEstimateLimiter, authMiddleware, async (req, res) => {
+  const rid = req.requestId;
+
+  if (!isReady()) {
+    return res.status(503).json({ ok: false, error: 'AI service not configured.' });
+  }
+
+  const { property } = req.body;
+  if (!property) {
+    return res.status(400).json({ ok: false, error: 'Missing property data.' });
+  }
+
+  const { GoogleGenerativeAI } = require('@google/generative-ai');
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || process.env.GEN_AI_KEY);
+  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+  const input = property.input || {};
+  const summary = property.summary || {};
+  const purchasePrice = summary.totalPayable || 0;
+  const purchaseDate = new Date(property.createdAt || Date.now());
+  const now = new Date();
+  const monthsHeld = Math.round((now - purchaseDate) / (30 * 24 * 60 * 60 * 1000));
+
+  const prompt = `
+You are an expert Egyptian real estate analyst with deep knowledge of the Egyptian property market in 2026.
+
+A property owner bought this property:
+- Property Type: ${input.propertyType || 'apartment'}
+- Location: ${input.location || 'Not specified'}
+- Project/Compound Name: ${input.propertyName || 'Not specified'}
+- Area: ${input.unitArea ? input.unitArea + ' sqm' : 'Not specified'}
+- Original Purchase Price: ${purchasePrice.toLocaleString()} EGP
+- Purchase Date: ${purchaseDate.toLocaleDateString('en-US')}
+- Months Since Purchase: ${monthsHeld} months
+- Delivery Date: ${input.deliveryDate || 'Not specified'}
+
+Based on your knowledge of:
+- Egyptian real estate market trends in 2026
+- Property values in ${input.location || 'Egypt'}
+- Annual appreciation rates in Egyptian compounds
+- Current economic conditions in Egypt
+- Demand and supply in this area
+
+Please provide a market estimate. Consider that:
+- New Cairo areas typically appreciate 13-18% annually
+- North Coast properties appreciate 18-25% annually
+- 6th of October appreciates 10-14% annually
+- Sheikh Zayed appreciates 12-16% annually
+- Ain Sokhna appreciates 20-28% annually
+- New Administrative Capital appreciates 15-22% annually
+- General Egyptian real estate has been strong due to currency devaluation
+
+Respond ONLY with this exact JSON format, no extra text:
+{
+  "estimatedCurrentValue": 7200000,
+  "annualAppreciationRate": 15.2,
+  "marketDirection": "rising",
+  "confidence": 78,
+  "recommendation": "hold",
+  "shortReason": "New Cairo prime compounds showing 15% annual growth",
+  "detailedReasons": [
+    "Limited supply of similar units in this area",
+    "Strong demand from Egyptian buyers and expats",
+    "Currency devaluation protecting real estate value",
+    "New infrastructure projects boosting area prices"
+  ],
+  "bestTimeToSell": "2028-2029",
+  "priceRangeMin": 6900000,
+  "priceRangeMax": 7500000,
+  "marketCondition": "sellers_market"
+}
+`;
+
+  try {
+    console.log(`[${rid}] Market estimate request for ${input.location || 'unknown location'}`);
+    const result = await model.generateContent(prompt);
+    const responseText = result.response.text();
+
+    const cleaned = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch {
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        parsed = JSON.parse(jsonMatch[0]);
+      } else {
+        throw new Error('Could not parse AI response');
+      }
+    }
+
+    const estimatedValue = parsed.estimatedCurrentValue || 0;
+    const profitAmount = estimatedValue - purchasePrice;
+    const profitPercentage = purchasePrice > 0
+      ? parseFloat(((profitAmount / purchasePrice) * 100).toFixed(1))
+      : 0;
+
+    console.log(`[${rid}] Market estimate done: ${estimatedValue.toLocaleString()} EGP`);
+
+    return res.json({
+      ok: true,
+      data: {
+        ...parsed,
+        purchasePrice,
+        profitAmount,
+        profitPercentage,
+        lastEstimated: new Date().toISOString().split('T')[0],
+        estimatedBy: 'gemini-1.5-flash',
+      },
+    });
+  } catch (err) {
+    console.error(`[${rid}] Market estimate error:`, err.message);
+    return res.status(500).json({ ok: false, error: 'Could not generate estimate. Please try again.' });
+  }
+});
+
 // ─── Startup ──────────────────────────────────────────────
 
 // Initialize Gemini
