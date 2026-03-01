@@ -216,7 +216,7 @@ app.post('/api/market-estimate', marketEstimateLimiter, authMiddleware, async (r
 
   const { GoogleGenerativeAI } = require('@google/generative-ai');
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || process.env.GEN_AI_KEY);
-  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
 
   const input = property.input || {};
   const summary = property.summary || {};
@@ -278,7 +278,8 @@ Respond ONLY with this exact JSON format, no extra text:
   try {
     console.log(`[${rid}] Market estimate request for ${input.location || 'unknown location'}`);
     const result = await model.generateContent(prompt);
-    const responseText = result.response.text();
+    const response = await result.response;
+    const responseText = response.text();
 
     const cleaned = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
     let parsed;
