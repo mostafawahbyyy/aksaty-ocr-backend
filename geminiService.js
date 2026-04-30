@@ -19,8 +19,16 @@ function initGemini(apiKey) {
   }
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
-    model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
-    console.log('[Gemini] Initialized with gemini-2.5-flash-lite');
+    // Switched from gemini-2.5-flash-lite → gemini-2.5-flash because Flash-Lite
+    // had reliability issues processing multi-page Arabic property-contract
+    // PDFs (silent extraction failures with no error surfaced). Regular Flash
+    // is the documented model for PDF document understanding and works well
+    // for both photos and PDFs at similar latency. Cost is slightly higher
+    // but worth it for the OCR success rate. If this ever needs to revert
+    // for cost reasons, swap to gemini-2.5-flash-lite-002 once Google ships
+    // that variant with improved document support.
+    model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    console.log('[Gemini] Initialized with gemini-2.5-flash');
     return true;
   } catch (err) {
     console.error('[Gemini] Init failed:', err.message);
@@ -28,11 +36,43 @@ function initGemini(apiKey) {
   }
 }
 
+// Optimistic: assume key works after init succeeds. The real check happens
+// on the first OCR request (which throws API_KEY_INVALID with proper error
+// code if the key is bad). validateKey() is a separate optional warmup
+// used in local dev; on Vercel serverless we skip it to avoid cold-start
+// latency and rely on per-request error handling instead.
+let keyValid = true;
+
 /**
- * Check if Gemini is ready
+ * Check if Gemini is ready (model initialized and key not known-bad)
  */
 function isReady() {
-  return model !== null;
+  return model !== null && keyValid;
+}
+
+/**
+ * Validate API key with a lightweight test call. Optional warmup — only
+ * called from local dev startup. If it fails, we mark the key invalid so
+ * /health reflects the truth and requests fast-fail with a proper code.
+ */
+async function validateKey() {
+  if (!model) { keyValid = false; return false; }
+  try {
+    await model.countTokens('test');
+    keyValid = true;
+    console.log('[Gemini] API key validated successfully');
+    return true;
+  } catch (err) {
+    keyValid = false;
+    console.error('[Gemini] API key validation FAILED:', err.message);
+    return false;
+  }
+}
+
+function getKeyStatus() {
+  if (!model) return 'no_key';
+  if (!keyValid) return 'invalid_key';
+  return 'valid';
 }
 
 // The core extraction prompt
@@ -54,13 +94,14 @@ DATE FORMAT HANDLING:
 - "2025-09-21" → "2025-09-21" (already ISO)
 - "٢١/٠٩/٢٠٢٥" → "2025-09-21"
 - If only month/year, use first of month: "03/2026" → "2026-03-01"
+- "Q1 2025" → "2025-01-01", "Q2 2025" → "2025-04-01", "Q3 2025" → "2025-07-01", "Q4 2025" → "2025-10-01"
 - If date is unreadable, use null
 
 CATEGORY RULES:
-- Contains "مقدم" or "down" or "دفعة أولى" or "booking" or "تعاقد" → "downPayment"
+- Contains "مقدم" or "down" or "دفعة أولى" or "booking" or "تعاقد" or "حجز" or "عربون" → "downPayment"
 - Contains "تسليم" or "delivery" or "استلام" → "delivery"
 - Contains "صيانة" or "maintenance" → "maintenance"
-- Everything else (قسط, installment, numbered payments) → "installment"
+- Everything else (قسط, أقساط, installment, numbered payments) → "installment"
 
 RESPOND WITH ONLY THIS JSON (no markdown, no backticks, no explanation):
 {
@@ -100,10 +141,6 @@ Include ALL rows. Amounts as numbers. Dates as YYYY-MM-DD or null.`;
 
 /**
  * Extract payment data from an image using Gemini
- *
- * @param {Buffer} imageBuffer - Processed image buffer
- * @param {string} mimeType - Image MIME type
- * @returns {Promise<Object>} Extracted data
  */
 async function extractPayments(imageBuffer, mimeType) {
   if (!model) throw new Error('Gemini not initialized');
@@ -134,6 +171,28 @@ async function extractPayments(imageBuffer, mimeType) {
     .map(cleanInstallment)
     .filter(inst => inst.amount > 0);
   console.log(`[Gemini] After cleaning: ${data.installments.length}/${beforeCount} installments kept`);
+
+  // Retry if average confidence is very low (likely bad OCR read)
+  if (data.installments.length > 0) {
+    const avgConf = data.installments.reduce((s, i) => s + (i.confidence || 0), 0) / data.installments.length;
+    if (avgConf < 0.5) {
+      console.log(`[Gemini] Low avg confidence (${avgConf.toFixed(2)}), retrying with simpler prompt...`);
+      const retryData = await attemptExtraction(imagePart, RETRY_PROMPT);
+      if (retryData && retryData.installments) {
+        const retryClean = retryData.installments.map(cleanInstallment).filter(i => i.amount > 0);
+        const retryAvg = retryClean.length > 0
+          ? retryClean.reduce((s, i) => s + (i.confidence || 0), 0) / retryClean.length
+          : 0;
+        if (retryAvg > avgConf && retryClean.length > 0) {
+          console.log(`[Gemini] Retry improved confidence: ${avgConf.toFixed(2)} → ${retryAvg.toFixed(2)}`);
+          data.installments = retryClean;
+        }
+      }
+    }
+  }
+
+  // Deduplicate by amount+date (Gemini may read the same row twice)
+  data.installments = deduplicateInstallments(data.installments);
 
   // Recalculate total if not provided
   if (!data.totals || !data.totals.scheduled_total) {
@@ -171,14 +230,34 @@ async function attemptExtraction(imagePart, prompt) {
     }
     return parsed;
   } catch (err) {
-    const msg = err.message || '';
-    console.error('[Gemini] Extraction error:', msg);
+    const msg = (err.message || '').toLowerCase();
+    console.error('[Gemini] Extraction error:', err.message);
 
-    // Detect quota/rate limit errors and throw so caller can show proper message
-    if (msg.includes('429') || msg.includes('quota') || msg.includes('Too Many Requests') || msg.includes('rate')) {
-      const quotaErr = new Error('QUOTA_EXCEEDED');
-      quotaErr.isQuota = true;
-      throw quotaErr;
+    // Classify provider errors into distinct, honest error codes
+    const ocrErr = (code, message) => {
+      const e = new Error(message || code);
+      e.errorCode = code;
+      return e;
+    };
+
+    if (msg.includes('api key') || msg.includes('api_key_invalid') || (msg.includes('invalid') && msg.includes('key')) || msg.includes('permission denied') || msg.includes('forbidden')) {
+      throw ocrErr('API_KEY_INVALID', 'Gemini API key is invalid or expired');
+    }
+
+    if (msg.includes('quota') || msg.includes('resource exhausted')) {
+      throw ocrErr('QUOTA_EXCEEDED', 'Gemini quota exceeded');
+    }
+
+    if (msg.includes('429') || msg.includes('too many requests') || msg.includes('rate limit')) {
+      throw ocrErr('RATE_LIMITED', 'Gemini rate limited');
+    }
+
+    if (msg.includes('safety') || msg.includes('blocked')) {
+      throw ocrErr('SAFETY_BLOCKED', 'Content blocked by safety filter');
+    }
+
+    if (msg.includes('timeout') || msg.includes('deadline') || msg.includes('timed out')) {
+      throw ocrErr('PROVIDER_TIMEOUT', 'Gemini request timed out');
     }
 
     return null;
@@ -189,17 +268,14 @@ async function attemptExtraction(imagePart, prompt) {
  * Parse JSON from Gemini response, handling markdown fences and other quirks
  */
 function parseGeminiJSON(text) {
-  // Strip markdown code fences
   let cleaned = text
     .replace(/```json\s*/gi, '')
     .replace(/```\s*/g, '')
     .trim();
 
-  // Try direct parse
   try {
     return JSON.parse(cleaned);
   } catch (e) {
-    // Try to find JSON object in the text
     const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       try {
@@ -212,6 +288,22 @@ function parseGeminiJSON(text) {
     console.error('[Gemini] No JSON found in response:', text.slice(0, 500));
     return null;
   }
+}
+
+/**
+ * Remove duplicate installments by amount+date key
+ */
+function deduplicateInstallments(installments) {
+  const seen = new Set();
+  return installments.filter(inst => {
+    const key = `${inst.amount}|${inst.date || 'nodate'}`;
+    if (seen.has(key)) {
+      console.log(`[Gemini] Dropping duplicate: ${key} (${inst.label})`);
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 /**
@@ -228,45 +320,42 @@ function cleanInstallment(inst) {
   };
 }
 
-/**
- * Clean amount value
- */
 function cleanAmount(val) {
   if (typeof val === 'number') return Math.max(0, val);
   if (typeof val === 'string') {
-    // Remove commas, currency, spaces, Arabic chars
     const num = parseFloat(val.replace(/[,\s٬]/g, '').replace(/[^\d.]/g, ''));
     return isNaN(num) ? 0 : Math.max(0, num);
   }
   return 0;
 }
 
-/**
- * Clean and normalize date to YYYY-MM-DD
- */
 function cleanDate(val) {
   if (!val || val === 'null' || val === 'N/A') return null;
 
   const str = String(val).trim();
 
-  // Already ISO format
   if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return str;
 
-  // DD/MM/YYYY or DD-MM-YYYY
   const dmyMatch = str.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
   if (dmyMatch) {
     const [, d, m, y] = dmyMatch;
     return `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
   }
 
-  // MM/YYYY
   const myMatch = str.match(/^(\d{1,2})[\/\-.](\d{4})$/);
   if (myMatch) {
     const [, m, y] = myMatch;
     return `${y}-${m.padStart(2, '0')}-01`;
   }
 
-  // Try native Date parse as last resort
+  const qMatch = str.match(/Q(\d)\s*[\/\-.]?\s*(\d{4})/i);
+  if (qMatch) {
+    const quarter = parseInt(qMatch[1]);
+    const year = qMatch[2];
+    const month = ((quarter - 1) * 3 + 1).toString().padStart(2, '0');
+    return `${year}-${month}-01`;
+  }
+
   const parsed = new Date(str);
   if (!isNaN(parsed.getTime())) {
     return parsed.toISOString().split('T')[0];
@@ -275,9 +364,6 @@ function cleanDate(val) {
   return null;
 }
 
-/**
- * Normalize category string
- */
 function cleanCategory(category, label) {
   const cat = (category || '').toLowerCase();
   const lbl = (label || '').toLowerCase();
@@ -287,12 +373,14 @@ function cleanCategory(category, label) {
   if (cat === 'maintenance') return 'maintenance';
   if (cat === 'installment' || cat === 'regular') return 'installment';
 
-  // Infer from label if category is missing
-  if (/down|مقدم|تعاقد|booking|دفعة أولى/i.test(lbl)) return 'downPayment';
+  if (/down|مقدم|تعاقد|booking|دفعة أولى|حجز|عربون/i.test(lbl)) return 'downPayment';
   if (/deliver|تسليم|استلام/i.test(lbl)) return 'delivery';
   if (/maint|صيانة/i.test(lbl)) return 'maintenance';
 
   return 'installment';
 }
 
-module.exports = { initGemini, isReady, extractPayments };
+module.exports = {
+  initGemini, isReady, extractPayments, validateKey, getKeyStatus,
+  _test: { cleanDate, cleanAmount, cleanCategory, cleanInstallment, deduplicateInstallments },
+};

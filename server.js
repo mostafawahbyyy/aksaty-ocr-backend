@@ -1,5 +1,5 @@
 /**
- * AKSATY OCR Backend Server
+ * AKSATY OCR Backend Server (Vercel Deploy)
  *
  * Gemini-only OCR with sharp image preprocessing.
  * Accepts contract photos/PDFs, extracts payment schedules.
@@ -17,7 +17,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 
 const { preprocessImage } = require('./imagePreprocessor');
-const { initGemini, isReady, extractPayments } = require('./geminiService');
+const { initGemini, isReady, extractPayments, validateKey, getKeyStatus } = require('./geminiService');
 const { verifyFirebaseToken } = require('./authMiddleware');
 
 const app = express();
@@ -41,12 +41,13 @@ const generalLimiter = rateLimit({
   message: { ok: false, error: 'Too many requests. Please try again later.' },
 });
 
-// OCR rate limit: 10 requests per minute per IP (OCR is expensive)
+// OCR rate limit: 10 requests per minute per user (OCR is expensive)
 const ocrLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => req.user?.uid || req.ip,
   message: { ok: false, error: 'Too many scan requests. Please wait a minute and try again.' },
 });
 
@@ -93,11 +94,13 @@ const authMiddleware = IS_PRODUCTION
 // ─── Health ───────────────────────────────────────────────
 
 app.get('/health', (req, res) => {
+  const keyStatus = getKeyStatus();
   res.json({
     status: 'ok',
     service: 'aksaty-ocr',
-    version: '3.1.0',
+    version: '3.3.0',
     gemini: isReady(),
+    geminiStatus: keyStatus,
     auth: IS_PRODUCTION ? 'required' : 'optional',
     timestamp: new Date().toISOString(),
   });
@@ -106,14 +109,37 @@ app.get('/health', (req, res) => {
 // ─── OCR Endpoint ─────────────────────────────────────────
 // Serves both paths so mobile doesn't need changes
 
+// Structured log for each OCR request (parseable by log aggregators)
+function logOCRRequest(rid, metrics) {
+  console.log(JSON.stringify({
+    event: 'ocr_request',
+    requestId: rid,
+    userId: metrics.userId,
+    fileType: metrics.fileType,
+    fileSizeKB: metrics.fileSizeKB,
+    preprocessMs: metrics.preprocessMs || null,
+    geminiMs: metrics.geminiMs || null,
+    installmentCount: metrics.installmentCount || 0,
+    avgConfidence: metrics.avgConfidence || null,
+    errorCode: metrics.errorCode || null,
+    status: metrics.status,
+    timestamp: new Date().toISOString(),
+  }));
+}
+
 const handleScan = async (req, res) => {
   const rid = req.requestId;
   const userId = req.user?.uid || 'unknown';
 
+  const keyStatus = getKeyStatus();
   if (!isReady()) {
+    const msg = keyStatus === 'invalid_key'
+      ? 'OCR service configuration error — API key is invalid.'
+      : 'OCR service not configured. Set GEMINI_API_KEY in .env';
     return res.status(503).json({
       ok: false,
-      error: 'OCR service not configured. Set GEMINI_API_KEY in .env',
+      error: msg,
+      errorCode: keyStatus === 'invalid_key' ? 'API_KEY_INVALID' : 'SERVICE_UNAVAILABLE',
     });
   }
 
@@ -133,25 +159,30 @@ const handleScan = async (req, res) => {
 
     // Preprocess image
     console.log(`[${rid}] Preprocessing image...`);
+    const preprocessStart = Date.now();
     const { buffer: processedBuffer, mimeType } = await preprocessImage(rawBuffer);
+    const preprocessMs = Date.now() - preprocessStart;
 
     // Send to Gemini
     console.log(`[${rid}] Sending to Gemini...`);
     const startTime = Date.now();
     const data = await extractPayments(processedBuffer, mimeType);
-    const elapsed = Date.now() - startTime;
-    console.log(`[${rid}] Gemini responded in ${elapsed}ms`);
+    const geminiMs = Date.now() - startTime;
+    console.log(`[${rid}] Gemini responded in ${geminiMs}ms`);
 
     // No data extracted
     if (!data || !data.installments || data.installments.length === 0) {
       console.log(`[${rid}] No payments found`);
+      logOCRRequest(rid, { userId, fileType: file.mimetype, fileSizeKB: Math.round(file.size / 1024), preprocessMs, geminiMs, status: 'no_data' });
       return res.json({
         ok: false,
         error: 'No payment table found in the document. Make sure the entire payment schedule is visible and the photo is clear.',
       });
     }
 
+    const avgConfidence = data.installments.reduce((s, i) => s + (i.confidence || 0), 0) / data.installments.length;
     console.log(`[${rid}] Success: ${data.installments.length} payments extracted`);
+    logOCRRequest(rid, { userId, fileType: file.mimetype, fileSizeKB: Math.round(file.size / 1024), preprocessMs, geminiMs, installmentCount: data.installments.length, avgConfidence: parseFloat(avgConfidence.toFixed(2)), status: 'success' });
 
     // Return in the format the mobile app expects
     return res.json({
@@ -166,30 +197,74 @@ const handleScan = async (req, res) => {
     });
 
   } catch (err) {
-    console.error(`[${rid}] Error:`, err.message);
+    console.error(`[${rid}] Error:`, err.message, err.errorCode ? `(${err.errorCode})` : '');
+    logOCRRequest(rid, { userId, fileType: file.mimetype, fileSizeKB: Math.round(file.size / 1024), errorCode: err.errorCode || 'PROCESSING_FAILED', status: 'error' });
 
-    // User-friendly error messages
-    let userMessage = 'Could not read the document. Try taking a clearer photo with better lighting.';
-    if (err.isQuota || err.message === 'QUOTA_EXCEEDED') {
-      userMessage = 'AI service is temporarily busy (rate limit). Please wait 1 minute and try again.';
-    } else if (err.message.includes('Could not process')) {
-      userMessage = 'Image format not supported. Please use JPEG, PNG, or PDF.';
-    } else if (err.message.includes('quota') || err.message.includes('rate') || err.message.includes('429')) {
-      userMessage = 'AI service is temporarily busy (rate limit). Please wait 1 minute and try again.';
-    } else if (err.message.includes('safety')) {
-      userMessage = 'Could not process this image. Please try a different photo.';
+    // Map errorCode to honest HTTP status + user message. Use file-type
+    // aware copy where it helps — telling a PDF-uploader to "take a clearer
+    // photo" is misleading.
+    const code = err.errorCode || '';
+    const incomingMime = req.file?.mimetype || '';
+    const isPdfUpload =
+      incomingMime === 'application/pdf' ||
+      (req.file?.buffer &&
+        req.file.buffer.length >= 4 &&
+        req.file.buffer[0] === 0x25 &&
+        req.file.buffer[1] === 0x50 &&
+        req.file.buffer[2] === 0x44 &&
+        req.file.buffer[3] === 0x46);
+
+    let status = 500;
+    let userMessage = isPdfUpload
+      ? 'Could not read this PDF. Make sure it contains a clear payment schedule (not a scanned image of poor quality).'
+      : 'Could not read the document. Try taking a clearer photo with better lighting.';
+
+    if (code === 'API_KEY_INVALID') {
+      status = 503;
+      userMessage = 'OCR service configuration error. Please contact support.';
+    } else if (code === 'QUOTA_EXCEEDED') {
+      status = 429;
+      userMessage = 'AI service quota exceeded. Please try again later.';
+    } else if (code === 'RATE_LIMITED') {
+      status = 429;
+      userMessage = 'Too many requests. Please wait a minute and try again.';
+    } else if (code === 'SAFETY_BLOCKED') {
+      status = 400;
+      userMessage = isPdfUpload
+        ? 'Could not process this PDF. Please try a different file.'
+        : 'Could not process this image. Please try a different photo.';
+    } else if (code === 'PROVIDER_TIMEOUT') {
+      status = 504;
+      userMessage = isPdfUpload
+        ? 'AI service timed out reading the PDF. The file may be too large — try uploading photos of the payment schedule instead.'
+        : 'AI service timed out. Please try again.';
+    } else if (code === 'PDF_RENDER_FAILED') {
+      status = 400;
+      userMessage = 'Could not read the PDF. Try uploading images instead.';
+    } else if ((err.message || '').includes('Could not process')) {
+      status = 400;
+      userMessage = 'File format not supported. Please use JPEG, PNG, or PDF.';
     }
 
-    return res.status(500).json({
+    // Surface the underlying provider error in a debug field. Only consumed
+    // by us via on-device logs / Sentry — clients don't display it. This is
+    // how we'll diagnose the next "PDF still doesn't work" without having
+    // to redeploy a logging build.
+    const debugError = (err && err.message) ? String(err.message).slice(0, 500) : null;
+
+    return res.status(status).json({
       ok: false,
       error: userMessage,
+      errorCode: code || 'PROCESSING_FAILED',
+      debugError,
+      fileType: isPdfUpload ? 'pdf' : (incomingMime || 'unknown'),
     });
   }
 };
 
-// Both paths: rate limit + auth + file upload + handler
-app.post('/api/ocr/local', ocrLimiter, authMiddleware, upload.single('contract'), handleScan);
-app.post('/api/scan-contract', ocrLimiter, authMiddleware, upload.single('contract'), handleScan);
+// Both paths: auth first (sets req.user for rate limit key) + rate limit + file upload + handler
+app.post('/api/ocr/local', authMiddleware, ocrLimiter, upload.single('contract'), handleScan);
+app.post('/api/scan-contract', authMiddleware, ocrLimiter, upload.single('contract'), handleScan);
 
 // ─── Market Estimate Endpoint ──────────────────────────────
 // Calls Gemini on the server side so the API key is never exposed in the app.
@@ -327,12 +402,18 @@ const geminiOk = initGemini(geminiKey);
 
 // Start server only when running locally (not on Vercel)
 if (process.env.VERCEL !== '1') {
-  app.listen(PORT, '0.0.0.0', () => {
+  app.listen(PORT, '0.0.0.0', async () => {
+    let keyStatus = 'no_key';
+    if (geminiOk) {
+      const valid = await validateKey();
+      keyStatus = valid ? 'VALID' : 'INVALID — OCR will reject requests';
+    }
+
     console.log(`\n=== AKSATY OCR Server ===`);
     console.log(`Port:   ${PORT}`);
     console.log(`Mode:   ${IS_PRODUCTION ? 'PRODUCTION' : 'DEVELOPMENT'}`);
     console.log(`Auth:   ${IS_PRODUCTION ? 'REQUIRED' : 'OPTIONAL'}`);
-    console.log(`Gemini: ${geminiOk ? 'Enabled' : 'DISABLED (no API key)'}`);
+    console.log(`Gemini: ${geminiOk ? `Key present (${keyStatus})` : 'DISABLED (no API key)'}`);
     console.log(`Limits: 100 req/15min (general), 10 req/min (OCR)`);
     console.log(`Routes: POST /api/ocr/local, POST /api/scan-contract`);
     console.log(`Health: GET /health`);
