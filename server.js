@@ -98,7 +98,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'aksaty-ocr',
-    version: '3.3.0',
+    version: '3.3.1',
     gemini: isReady(),
     geminiStatus: keyStatus,
     auth: IS_PRODUCTION ? 'required' : 'optional',
