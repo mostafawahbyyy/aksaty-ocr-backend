@@ -98,7 +98,7 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'aksaty-ocr',
-    version: '3.3.1',
+    version: '3.4.0',
     gemini: isReady(),
     geminiStatus: keyStatus,
     auth: IS_PRODUCTION ? 'required' : 'optional',
@@ -233,6 +233,9 @@ const handleScan = async (req, res) => {
       userMessage = isPdfUpload
         ? 'Could not process this PDF. Please try a different file.'
         : 'Could not process this image. Please try a different photo.';
+    } else if (code === 'MODEL_OVERLOADED') {
+      status = 503;
+      userMessage = 'AI service is temporarily busy. Please try again in a minute.';
     } else if (code === 'PROVIDER_TIMEOUT') {
       status = 504;
       userMessage = isPdfUpload

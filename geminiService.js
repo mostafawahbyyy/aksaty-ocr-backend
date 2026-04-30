@@ -6,7 +6,9 @@
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-let model = null;
+let model = null;          // Primary: gemini-2.5-flash (best PDF accuracy)
+let fallbackModel = null;  // Fallback: gemini-2.5-flash-lite (less load, used on 503)
+let genAIInstance = null;
 
 /**
  * Initialize the Gemini model
@@ -18,17 +20,10 @@ function initGemini(apiKey) {
     return false;
   }
   try {
-    const genAI = new GoogleGenerativeAI(apiKey);
-    // Switched from gemini-2.5-flash-lite → gemini-2.5-flash because Flash-Lite
-    // had reliability issues processing multi-page Arabic property-contract
-    // PDFs (silent extraction failures with no error surfaced). Regular Flash
-    // is the documented model for PDF document understanding and works well
-    // for both photos and PDFs at similar latency. Cost is slightly higher
-    // but worth it for the OCR success rate. If this ever needs to revert
-    // for cost reasons, swap to gemini-2.5-flash-lite-002 once Google ships
-    // that variant with improved document support.
-    model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-    console.log('[Gemini] Initialized with gemini-2.5-flash');
+    genAIInstance = new GoogleGenerativeAI(apiKey);
+    model = genAIInstance.getGenerativeModel({ model: 'gemini-2.5-flash' });
+    fallbackModel = genAIInstance.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
+    console.log('[Gemini] Initialized: primary=gemini-2.5-flash, fallback=gemini-2.5-flash-lite');
     return true;
   } catch (err) {
     console.error('[Gemini] Init failed:', err.message);
@@ -44,16 +39,21 @@ function initGemini(apiKey) {
 let keyValid = true;
 
 /**
- * Check if Gemini is ready (model initialized and key not known-bad)
+ * Check if Gemini is ready (model initialized — does not depend on
+ * keyValid because transient 503 / overload from Gemini was incorrectly
+ * marking the key invalid and bouncing all requests with a misleading
+ * "API key is invalid" message. Real auth failures are still surfaced
+ * through the per-request errorCode pipeline below.)
  */
 function isReady() {
-  return model !== null && keyValid;
+  return model !== null;
 }
 
 /**
- * Validate API key with a lightweight test call. Optional warmup — only
- * called from local dev startup. If it fails, we mark the key invalid so
- * /health reflects the truth and requests fast-fail with a proper code.
+ * Validate API key with a lightweight test call. Used for the /health
+ * geminiStatus diagnostic only. Critically, only marks keyValid=false
+ * for ACTUAL auth-shaped errors — not for transient 503/quota/network
+ * issues, which were causing false-negative health reports.
  */
 async function validateKey() {
   if (!model) { keyValid = false; return false; }
@@ -63,9 +63,22 @@ async function validateKey() {
     console.log('[Gemini] API key validated successfully');
     return true;
   } catch (err) {
-    keyValid = false;
-    console.error('[Gemini] API key validation FAILED:', err.message);
-    return false;
+    const msg = (err.message || '').toLowerCase();
+    const isAuthError =
+      msg.includes('api key not valid') ||
+      msg.includes('api key expired') ||
+      msg.includes('api_key_invalid') ||
+      msg.includes('permission denied') ||
+      msg.includes('forbidden') ||
+      msg.includes('unauthenticated');
+    if (isAuthError) {
+      keyValid = false;
+      console.error('[Gemini] API key validation FAILED (auth error):', err.message);
+    } else {
+      // Transient (503, network, etc.) — leave keyValid alone, log only
+      console.warn('[Gemini] validateKey transient error (key still considered valid):', err.message);
+    }
+    return keyValid;
   }
 }
 
@@ -152,13 +165,33 @@ async function extractPayments(imageBuffer, mimeType) {
     },
   };
 
-  // First attempt (will throw if quota exceeded)
-  let data = await attemptExtraction(imagePart, EXTRACTION_PROMPT);
+  // First attempt: primary model (gemini-2.5-flash). If it throws
+  // MODEL_OVERLOADED (Google's 503 spike), transparently retry on the
+  // fallback model (gemini-2.5-flash-lite) which has different capacity.
+  let data;
+  try {
+    data = await attemptExtraction(imagePart, EXTRACTION_PROMPT, model);
+  } catch (err) {
+    if (err.errorCode === 'MODEL_OVERLOADED' && fallbackModel) {
+      console.log('[Gemini] Primary overloaded — falling back to gemini-2.5-flash-lite');
+      data = await attemptExtraction(imagePart, EXTRACTION_PROMPT, fallbackModel);
+    } else {
+      throw err;
+    }
+  }
 
   // If first attempt returned no installments, retry with simpler prompt
   if (!data || !data.installments || data.installments.length === 0) {
     console.log('[Gemini] First attempt returned no data, retrying with simpler prompt...');
-    data = await attemptExtraction(imagePart, RETRY_PROMPT);
+    try {
+      data = await attemptExtraction(imagePart, RETRY_PROMPT, model);
+    } catch (err) {
+      if (err.errorCode === 'MODEL_OVERLOADED' && fallbackModel) {
+        data = await attemptExtraction(imagePart, RETRY_PROMPT, fallbackModel);
+      } else {
+        throw err;
+      }
+    }
   }
 
   if (!data || !data.installments || data.installments.length === 0) {
@@ -210,11 +243,14 @@ async function extractPayments(imageBuffer, mimeType) {
 }
 
 /**
- * Attempt a single extraction with a given prompt
+ * Attempt a single extraction with a given prompt and model.
+ * @param {object} imagePart - inlineData part for Gemini
+ * @param {string} prompt
+ * @param {object} m - the model instance to use (primary or fallback)
  */
-async function attemptExtraction(imagePart, prompt) {
+async function attemptExtraction(imagePart, prompt, m = model) {
   try {
-    const result = await model.generateContent([prompt, imagePart]);
+    const result = await m.generateContent([prompt, imagePart]);
     const response = await result.response;
     const text = response.text();
 
@@ -240,8 +276,24 @@ async function attemptExtraction(imagePart, prompt) {
       return e;
     };
 
-    if (msg.includes('api key') || msg.includes('api_key_invalid') || (msg.includes('invalid') && msg.includes('key')) || msg.includes('permission denied') || msg.includes('forbidden')) {
+    // Specific auth-error markers only — never just substring 'api key'
+    // (which would match 'API key abc... — service unavailable' style
+    // messages and falsely classify everything as auth failure).
+    if (
+      msg.includes('api key not valid') ||
+      msg.includes('api key expired') ||
+      msg.includes('api_key_invalid') ||
+      msg.includes('unauthenticated') ||
+      msg.includes('permission denied') ||
+      msg.includes('forbidden')
+    ) {
       throw ocrErr('API_KEY_INVALID', 'Gemini API key is invalid or expired');
+    }
+
+    // Model overloaded — Gemini 2.5 Flash returns 503 "experiencing high
+    // demand" when capacity is tight. Distinct from quota/rate-limit.
+    if (msg.includes('503') || msg.includes('service unavailable') || msg.includes('high demand') || msg.includes('overloaded')) {
+      throw ocrErr('MODEL_OVERLOADED', 'Gemini model temporarily overloaded');
     }
 
     if (msg.includes('quota') || msg.includes('resource exhausted')) {
