@@ -400,6 +400,16 @@ Respond ONLY with this exact JSON format, no extra text:
 const geminiKey = process.env.GEMINI_API_KEY || process.env.GEN_AI_KEY;
 const geminiOk = initGemini(geminiKey);
 
+// Validate the key at module load (works in BOTH local and Vercel cold-start)
+// so /health reports the truth and we don't waste a request to discover a
+// dead key. Fire-and-forget; isReady() defaults optimistic so the first
+// request has a chance even if validation hasn't finished.
+if (geminiOk) {
+  validateKey()
+    .then((valid) => console.log(`[Gemini] Key validation: ${valid ? 'VALID' : 'INVALID — OCR will reject requests'}`))
+    .catch((err) => console.error('[Gemini] Key validation crashed:', err.message));
+}
+
 // Start server only when running locally (not on Vercel)
 if (process.env.VERCEL !== '1') {
   app.listen(PORT, '0.0.0.0', async () => {
